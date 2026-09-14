@@ -16,7 +16,6 @@ import {
 export type Tool = "pen" | "highlighter" | "eraser" | "text"
 
 type Point = { x: number; y: number }
-
 type ClientPointEvent = { clientX: number; clientY: number }
 
 type StrokeElement = {
@@ -37,7 +36,6 @@ type TextElement = {
 }
 
 type Element = StrokeElement | TextElement
-
 type TextEditorState = { x: number; y: number; value: string }
 
 export type WhiteboardDocument = {
@@ -76,12 +74,17 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
   const surfaceRef = useRef<HTMLDivElement>(null)
   const textEditorRef = useRef<HTMLTextAreaElement>(null)
 
-  // Persistent drawing state (kept in refs so pointer handlers stay stable).
   const elementsRef = useRef<Element[]>([])
   const redoRef = useRef<Element[]>([])
   const drawingRef = useRef(false)
   const currentStrokeRef = useRef<StrokeElement | null>(null)
   const logicalSizeRef = useRef({ width: 0, height: 0 })
+
+  // Keep pointer rendering outside React's render cycle. Points are batched
+  // into animation frames so fast pointer events do not cause full-canvas redraws.
+  const drawFrameRef = useRef<number | null>(null)
+  const pendingPointsRef = useRef<Point[]>([])
+  const lastRenderedPointRef = useRef<Point | null>(null)
 
   const toolRef = useRef(tool)
   const colorRef = useRef(color)
@@ -99,7 +102,6 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
 
   useEffect(() => {
     if (!textEditor) return
-
     const id = requestAnimationFrame(() => {
       const editor = textEditorRef.current
       if (!editor) return
@@ -107,7 +109,6 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
       const len = editor.value.length
       editor.setSelectionRange(len, len)
     })
-
     return () => cancelAnimationFrame(id)
   }, [textEditor])
 
@@ -131,7 +132,6 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
       const [first, ...rest] = el.points
       ctx.moveTo(first.x, first.y)
       if (rest.length === 0) {
-        // A single dot.
         ctx.lineTo(first.x + 0.01, first.y + 0.01)
       } else {
         for (const p of rest) ctx.lineTo(p.x, p.y)
@@ -163,8 +163,7 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
     ctx.fillRect(0, 0, width, height)
     for (const el of elementsRef.current) drawElement(ctx, el)
     if (currentStrokeRef.current) drawElement(ctx, currentStrokeRef.current)
-    
-    // Draw watermark
+
     ctx.save()
     ctx.globalAlpha = 0.15
     ctx.fillStyle = "#cccccc"
@@ -174,6 +173,50 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
     ctx.fillText("www.techsavyy.com", width / 2, height / 2)
     ctx.restore()
   }, [drawElement])
+
+  // Draw only the newly arrived segment. The expensive full redraw is now
+  // reserved for operations such as undo, redo, erase, load and resize.
+  const drawIncrementalPoint = useCallback((point: Point) => {
+    const canvas = canvasRef.current
+    const stroke = currentStrokeRef.current
+    const previous = lastRenderedPointRef.current
+    if (!canvas || !stroke) return
+
+    const ctx = canvas.getContext("2d")
+    if (!ctx) return
+
+    ctx.save()
+    ctx.strokeStyle = stroke.color
+    ctx.lineWidth = stroke.size
+    ctx.lineCap = "round"
+    ctx.lineJoin = "round"
+    ctx.globalAlpha = stroke.tool === "highlighter" ? 0.35 : 1
+    ctx.beginPath()
+
+    if (previous) {
+      ctx.moveTo(previous.x, previous.y)
+      ctx.lineTo(point.x, point.y)
+    } else {
+      ctx.moveTo(point.x, point.y)
+      ctx.lineTo(point.x + 0.01, point.y + 0.01)
+    }
+
+    ctx.stroke()
+    ctx.restore()
+    lastRenderedPointRef.current = point
+  }, [])
+
+  const flushPendingPoints = useCallback(() => {
+    drawFrameRef.current = null
+    const points = pendingPointsRef.current
+    pendingPointsRef.current = []
+    for (const point of points) drawIncrementalPoint(point)
+  }, [drawIncrementalPoint])
+
+  const schedulePointRender = useCallback(() => {
+    if (drawFrameRef.current !== null) return
+    drawFrameRef.current = requestAnimationFrame(flushPendingPoints)
+  }, [flushPendingPoints])
 
   const setupCanvas = useCallback(() => {
     const canvas = canvasRef.current
@@ -187,7 +230,10 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
     canvas.style.width = `${rect.width}px`
     canvas.style.height = `${rect.height}px`
     const ctx = canvas.getContext("2d")
-    if (ctx) ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    if (ctx) {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      ctx.imageSmoothingEnabled = true
+    }
     redraw()
   }, [redraw])
 
@@ -198,19 +244,21 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
   useEffect(() => {
     const container = containerRef.current
     if (!container) return
-
     const syncContainerSize = () => {
       const rect = container.getBoundingClientRect()
       if (rect.width <= 0 || rect.height <= 0) return
       setContainerSize({ width: Math.round(rect.width), height: Math.round(rect.height) })
     }
-
     syncContainerSize()
-
     const observer = new ResizeObserver(syncContainerSize)
     observer.observe(container)
-
     return () => observer.disconnect()
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (drawFrameRef.current !== null) cancelAnimationFrame(drawFrameRef.current)
+    }
   }, [])
 
   const getPos = (e: ClientPointEvent): Point => {
@@ -227,6 +275,8 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
       notifyHistory()
     }
     currentStrokeRef.current = null
+    lastRenderedPointRef.current = null
+    pendingPointsRef.current = []
   }, [onDirty, notifyHistory])
 
   const eraseAt = useCallback(
@@ -236,7 +286,6 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
         if (el.type === "stroke") {
           return !el.points.some((pt) => Math.hypot(pt.x - p.x, pt.y - p.y) <= ERASER_RADIUS + el.size / 2)
         }
-        // Rough hit box for text.
         const approxWidth = el.text.length * el.size * 0.5
         return !(p.x >= el.x - 4 && p.x <= el.x + approxWidth + 4 && p.y >= el.y - 4 && p.y <= el.y + el.size + 4)
       })
@@ -275,25 +324,43 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
       size: sizeRef.current,
       points: [p],
     }
-    redraw()
+    lastRenderedPointRef.current = null
+    pendingPointsRef.current = [p]
+    schedulePointRender()
   }
 
   const handlePointerMove = (e: ReactPointerEvent<HTMLCanvasElement>) => {
     if (!drawingRef.current) return
-    const p = getPos(e)
+
+    const nativeEvent = e.nativeEvent
+    const events = typeof nativeEvent.getCoalescedEvents === "function" ? nativeEvent.getCoalescedEvents() : [nativeEvent]
+
     if (toolRef.current === "eraser") {
-      eraseAt(p)
+      for (const event of events) eraseAt(getPos(event))
       return
     }
-    if (currentStrokeRef.current) {
-      currentStrokeRef.current.points.push(p)
-      redraw()
+
+    const stroke = currentStrokeRef.current
+    if (!stroke) return
+
+    for (const event of events) {
+      const p = getPos(event)
+      stroke.points.push(p)
+      pendingPointsRef.current.push(p)
     }
+    schedulePointRender()
   }
 
   const handlePointerUp = () => {
     if (!drawingRef.current) return
     drawingRef.current = false
+
+    if (drawFrameRef.current !== null) {
+      cancelAnimationFrame(drawFrameRef.current)
+      drawFrameRef.current = null
+    }
+    flushPendingPoints()
+
     if (toolRef.current !== "eraser") commitStroke()
     redraw()
   }
@@ -352,6 +419,8 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
         elementsRef.current = doc?.elements ? structuredClone(doc.elements) : []
         redoRef.current = []
         currentStrokeRef.current = null
+        pendingPointsRef.current = []
+        lastRenderedPointRef.current = null
         if (doc?.width && doc?.height) {
           setBoardSize({ width: doc.width, height: doc.height })
         } else {
@@ -365,6 +434,8 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
         elementsRef.current = []
         redoRef.current = []
         currentStrokeRef.current = null
+        pendingPointsRef.current = []
+        lastRenderedPointRef.current = null
         onDirty?.()
         redraw()
         notifyHistory()
@@ -393,8 +464,7 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
     [redraw, notifyHistory, onDirty],
   )
 
-  const cursor =
-    tool === "text" ? "text" : tool === "eraser" ? "cell" : "crosshair"
+  const cursor = tool === "text" ? "text" : tool === "eraser" ? "cell" : "crosshair"
 
   return (
     <div ref={containerRef} className="relative h-full w-full overflow-hidden bg-white">
