@@ -25,3 +25,8 @@ logs/
 *.log
 .env
 .env.*
+!.env.example
+.dev.vars
+.vinext/
+.cloudflare/
+.env.example

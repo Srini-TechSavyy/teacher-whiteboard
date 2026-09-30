@@ -1,6 +1,6 @@
 "use server"
 
-import { db } from "@/lib/db"
+import { getDb } from "@/lib/db"
 import { classNotes, students } from "@/lib/db/schema"
 import { and, desc, eq } from "drizzle-orm"
 import { revalidatePath } from "next/cache"
@@ -8,6 +8,7 @@ import { revalidatePath } from "next/cache"
 export type WhiteboardData = unknown
 
 export async function getNote(studentId: number, date: string) {
+  const db = await getDb()
   const [row] = await db
     .select()
     .from(classNotes)
@@ -27,6 +28,7 @@ export async function saveNote(input: {
   if (!input.studentId) throw new Error("Please select a student before saving.")
   if (!input.date) throw new Error("Please select a date before saving.")
 
+  const db = await getDb()
   const [row] = await db
     .insert(classNotes)
     .values({
@@ -63,6 +65,7 @@ export type NoteHistoryRow = {
 }
 
 export async function getNotesHistory(studentId?: number): Promise<NoteHistoryRow[]> {
+  const db = await getDb()
   const rows = await db
     .select({
       id: classNotes.id,
@@ -80,12 +83,14 @@ export async function getNotesHistory(studentId?: number): Promise<NoteHistoryRo
 }
 
 export async function deleteNote(id: number) {
+  const db = await getDb()
   await db.delete(classNotes).where(eq(classNotes.id, id))
   revalidatePath("/")
 }
 
 // Full note payloads for the local-first sync engine (pull step).
 export async function getAllNotes() {
+  const db = await getDb()
   return db
     .select({
       id: classNotes.id,

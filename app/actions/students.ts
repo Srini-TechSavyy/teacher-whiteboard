@@ -1,11 +1,12 @@
 "use server"
 
-import { db } from "@/lib/db"
+import { getDb } from "@/lib/db"
 import { students } from "@/lib/db/schema"
 import { asc, eq } from "drizzle-orm"
 import { revalidatePath } from "next/cache"
 
 export async function getStudents() {
+  const db = await getDb()
   return db.select().from(students).orderBy(asc(students.name))
 }
 
@@ -13,6 +14,7 @@ export async function createStudent(input: { name: string; grade?: string; notes
   const name = input.name?.trim()
   if (!name) throw new Error("Student name is required")
 
+  const db = await getDb()
   const [row] = await db
     .insert(students)
     .values({
@@ -30,6 +32,7 @@ export async function updateStudent(input: { id: number; name: string; grade?: s
   const name = input.name?.trim()
   if (!name) throw new Error("Student name is required")
 
+  const db = await getDb()
   const [row] = await db
     .update(students)
     .set({
@@ -46,6 +49,7 @@ export async function updateStudent(input: { id: number; name: string; grade?: s
 }
 
 export async function deleteStudent(id: number) {
+  const db = await getDb()
   // Remove the student's notes first, then the student.
   const { classNotes } = await import("@/lib/db/schema")
   await db.delete(classNotes).where(eq(classNotes.studentId, id))
