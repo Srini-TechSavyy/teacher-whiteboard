@@ -1,4 +1,4 @@
-# teacher-whiteboard
+whiteboard
 
 Next.js teacher whiteboard with local-first IndexedDB sync and PostgreSQL on the server.
 
