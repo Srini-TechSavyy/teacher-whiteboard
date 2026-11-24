@@ -63,7 +63,25 @@ type Props = {
   onHistoryChange?: (state: { canUndo: boolean; canRedo: boolean }) => void
 }
 
-const ERASER_RADIUS = 14
+const ERASER_DIAMETER = 45
+const ERASER_RADIUS = ERASER_DIAMETER / 2
+
+function eraserCursor(diameter: number): string {
+  const r = diameter / 2
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${diameter}" height="${diameter}"><circle cx="${r}" cy="${r}" r="${r - 1.5}" fill="rgba(255,255,255,0.35)" stroke="rgba(15,23,42,0.65)" stroke-width="1.5"/></svg>`
+  return `url("data:image/svg+xml,${encodeURIComponent(svg)}") ${r} ${r}, crosshair`
+}
+
+function cloneElements(elements: Element[]): Element[] {
+  return structuredClone(elements)
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  const tag = target.tagName
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true
+  return target.isContentEditable
+}
 
 export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboard(
   { tool, color, size, onDirty, onHistoryChange },
@@ -75,8 +93,11 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
   const textEditorRef = useRef<HTMLTextAreaElement>(null)
 
   const elementsRef = useRef<Element[]>([])
-  const redoRef = useRef<Element[]>([])
+  const pastRef = useRef<Element[][]>([])
+  const futureRef = useRef<Element[][]>([])
   const drawingRef = useRef(false)
+  const eraseSessionStartRef = useRef<Element[] | null>(null)
+  const eraseRedrawFrameRef = useRef<number | null>(null)
   const currentStrokeRef = useRef<StrokeElement | null>(null)
   const logicalSizeRef = useRef({ width: 0, height: 0 })
 
@@ -114,10 +135,16 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
 
   const notifyHistory = useCallback(() => {
     onHistoryChange?.({
-      canUndo: elementsRef.current.length > 0,
-      canRedo: redoRef.current.length > 0,
+      canUndo: pastRef.current.length > 0,
+      canRedo: futureRef.current.length > 0,
     })
   }, [onHistoryChange])
+
+  const recordHistory = useCallback(() => {
+    pastRef.current.push(cloneElements(elementsRef.current))
+    futureRef.current = []
+    notifyHistory()
+  }, [notifyHistory])
 
   const drawElement = useCallback((ctx: CanvasRenderingContext2D, el: Element) => {
     if (el.type === "stroke") {
@@ -258,6 +285,7 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
   useEffect(() => {
     return () => {
       if (drawFrameRef.current !== null) cancelAnimationFrame(drawFrameRef.current)
+      if (eraseRedrawFrameRef.current !== null) cancelAnimationFrame(eraseRedrawFrameRef.current)
     }
   }, [])
 
@@ -269,15 +297,22 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
 
   const commitStroke = useCallback(() => {
     if (currentStrokeRef.current && currentStrokeRef.current.points.length > 0) {
+      recordHistory()
       elementsRef.current.push(currentStrokeRef.current)
-      redoRef.current = []
       onDirty?.()
-      notifyHistory()
     }
     currentStrokeRef.current = null
     lastRenderedPointRef.current = null
     pendingPointsRef.current = []
-  }, [onDirty, notifyHistory])
+  }, [onDirty, recordHistory])
+
+  const scheduleEraseRedraw = useCallback(() => {
+    if (eraseRedrawFrameRef.current !== null) return
+    eraseRedrawFrameRef.current = requestAnimationFrame(() => {
+      eraseRedrawFrameRef.current = null
+      redraw()
+    })
+  }, [redraw])
 
   const eraseAt = useCallback(
     (p: Point) => {
@@ -287,17 +322,38 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
           return !el.points.some((pt) => Math.hypot(pt.x - p.x, pt.y - p.y) <= ERASER_RADIUS + el.size / 2)
         }
         const approxWidth = el.text.length * el.size * 0.5
-        return !(p.x >= el.x - 4 && p.x <= el.x + approxWidth + 4 && p.y >= el.y - 4 && p.y <= el.y + el.size + 4)
+        const pad = ERASER_RADIUS
+        return !(
+          p.x >= el.x - pad &&
+          p.x <= el.x + approxWidth + pad &&
+          p.y >= el.y - pad &&
+          p.y <= el.y + el.size * 1.2 + pad
+        )
       })
-      if (elementsRef.current.length !== before) {
-        redoRef.current = []
-        onDirty?.()
-        notifyHistory()
-        redraw()
-      }
+      if (elementsRef.current.length !== before) scheduleEraseRedraw()
     },
-    [onDirty, notifyHistory, redraw],
+    [scheduleEraseRedraw],
   )
+
+  const finishEraseSession = useCallback(() => {
+    const start = eraseSessionStartRef.current
+    eraseSessionStartRef.current = null
+    if (!start) return
+    if (eraseRedrawFrameRef.current !== null) {
+      cancelAnimationFrame(eraseRedrawFrameRef.current)
+      eraseRedrawFrameRef.current = null
+    }
+    const changed =
+      start.length !== elementsRef.current.length ||
+      start.some((el, i) => JSON.stringify(el) !== JSON.stringify(elementsRef.current[i]))
+    if (changed) {
+      pastRef.current.push(start)
+      futureRef.current = []
+      onDirty?.()
+      notifyHistory()
+    }
+    redraw()
+  }, [notifyHistory, onDirty, redraw])
 
   const handlePointerDown = (e: ReactPointerEvent<HTMLCanvasElement>) => {
     if (textEditor) return
@@ -313,6 +369,7 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
     drawingRef.current = true
 
     if (t === "eraser") {
+      eraseSessionStartRef.current = cloneElements(elementsRef.current)
       eraseAt(p)
       return
     }
@@ -361,8 +418,12 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
     }
     flushPendingPoints()
 
-    if (toolRef.current !== "eraser") commitStroke()
-    redraw()
+    if (toolRef.current === "eraser") {
+      finishEraseSession()
+    } else {
+      commitStroke()
+      redraw()
+    }
   }
 
   const handleCanvasClick = (e: ReactMouseEvent<HTMLCanvasElement>) => {
@@ -374,6 +435,7 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
   const commitText = useCallback(() => {
     setTextEditor((cur: TextEditorState | null) => {
       if (cur && cur.value.trim()) {
+        recordHistory()
         elementsRef.current.push({
           type: "text",
           x: cur.x,
@@ -382,14 +444,34 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
           color: colorRef.current,
           size: Math.max(16, sizeRef.current * 4),
         })
-        redoRef.current = []
         onDirty?.()
-        notifyHistory()
         redraw()
       }
       return null
     })
-  }, [onDirty, notifyHistory, redraw])
+  }, [onDirty, recordHistory, redraw])
+
+  const applyUndo = useCallback(() => {
+    const previous = pastRef.current.pop()
+    if (!previous) return false
+    futureRef.current.push(cloneElements(elementsRef.current))
+    elementsRef.current = cloneElements(previous)
+    onDirty?.()
+    redraw()
+    notifyHistory()
+    return true
+  }, [notifyHistory, onDirty, redraw])
+
+  const applyRedo = useCallback(() => {
+    const next = futureRef.current.pop()
+    if (!next) return false
+    pastRef.current.push(cloneElements(elementsRef.current))
+    elementsRef.current = cloneElements(next)
+    onDirty?.()
+    redraw()
+    notifyHistory()
+    return true
+  }, [notifyHistory, onDirty, redraw])
 
   const extendDownward = useCallback(
     (factor: number) => {
@@ -417,7 +499,9 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
       }),
       load: (doc: WhiteboardDocument | null) => {
         elementsRef.current = doc?.elements ? structuredClone(doc.elements) : []
-        redoRef.current = []
+        pastRef.current = []
+        futureRef.current = []
+        eraseSessionStartRef.current = null
         currentStrokeRef.current = null
         pendingPointsRef.current = []
         lastRenderedPointRef.current = null
@@ -431,8 +515,8 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
       },
       clear: () => {
         if (elementsRef.current.length === 0) return
+        recordHistory()
         elementsRef.current = []
-        redoRef.current = []
         currentStrokeRef.current = null
         pendingPointsRef.current = []
         lastRenderedPointRef.current = null
@@ -441,30 +525,35 @@ export const Whiteboard = forwardRef<WhiteboardHandle, Props>(function Whiteboar
         notifyHistory()
       },
       undo: () => {
-        const el = elementsRef.current.pop()
-        if (el) {
-          redoRef.current.push(el)
-          onDirty?.()
-          redraw()
-          notifyHistory()
-        }
+        applyUndo()
       },
       redo: () => {
-        const el = redoRef.current.pop()
-        if (el) {
-          elementsRef.current.push(el)
-          onDirty?.()
-          redraw()
-          notifyHistory()
-        }
+        applyRedo()
       },
-      canUndo: () => elementsRef.current.length > 0,
-      canRedo: () => redoRef.current.length > 0,
+      canUndo: () => pastRef.current.length > 0,
+      canRedo: () => futureRef.current.length > 0,
     }),
-    [redraw, notifyHistory, onDirty],
+    [applyRedo, applyUndo, notifyHistory, onDirty, recordHistory, redraw],
   )
 
-  const cursor = tool === "text" ? "text" : tool === "eraser" ? "cell" : "crosshair"
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.altKey) return
+      if (textEditor || isEditableTarget(e.target)) return
+      const key = e.key.toLowerCase()
+      if (key === "z" && !e.shiftKey) {
+        if (!applyUndo()) return
+        e.preventDefault()
+      } else if ((key === "z" && e.shiftKey) || key === "y") {
+        if (!applyRedo()) return
+        e.preventDefault()
+      }
+    }
+    window.addEventListener("keydown", onKeyDown)
+    return () => window.removeEventListener("keydown", onKeyDown)
+  }, [textEditor, applyRedo, applyUndo])
+
+  const cursor = tool === "text" ? "text" : tool === "eraser" ? eraserCursor(ERASER_DIAMETER) : "crosshair"
 
   return (
     <div ref={containerRef} className="relative h-full w-full overflow-hidden bg-white">
